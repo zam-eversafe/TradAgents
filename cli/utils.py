@@ -9,6 +9,7 @@ from rich.console import Console
 from cli.models import AnalystType, AssetType
 from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.model_catalog import get_model_options
+from tradingagents.ticker_utils import normalize_ticker_symbol
 
 console = Console()
 
@@ -51,11 +52,6 @@ def get_ticker() -> str:
         exit(1)
 
     return normalize_ticker_symbol(ticker) if ticker.strip() else "SPY"
-
-
-def normalize_ticker_symbol(ticker: str) -> str:
-    """Normalize ticker input while preserving exchange suffixes."""
-    return ticker.strip().upper()
 
 
 def detect_asset_type(ticker: str) -> AssetType:
@@ -222,12 +218,22 @@ def _prompt_custom_model_id() -> str:
     ).ask().strip()
 
 
+def _prompt_bedrock_model_id() -> str:
+    """Prompt user to type a Bedrock model ID or inference profile ARN."""
+    return questionary.text(
+        "Enter AWS Bedrock model ID or inference profile ARN:",
+        validate=lambda x: len(x.strip()) > 0 or "Please enter a Bedrock model ID.",
+    ).ask().strip()
+
+
 def _select_model(provider: str, mode: str) -> str:
     """Select a model for the given provider and mode (quick/deep)."""
-    if provider.lower() == "openrouter":
+    provider_lower = provider.lower()
+
+    if provider_lower == "openrouter":
         return select_openrouter_model()
 
-    if provider.lower() == "azure":
+    if provider_lower == "azure":
         return questionary.text(
             f"Enter Azure deployment name ({mode}-thinking):",
             validate=lambda x: len(x.strip()) > 0 or "Please enter a deployment name.",
@@ -254,6 +260,8 @@ def _select_model(provider: str, mode: str) -> str:
         exit(1)
 
     if choice == "custom":
+        if provider_lower == "bedrock":
+            return _prompt_bedrock_model_id()
         return _prompt_custom_model_id()
 
     return choice
@@ -289,6 +297,7 @@ def _llm_provider_table() -> list[tuple[str, str, str | None]]:
         ("MiniMax", "minimax", "https://api.minimax.io/v1"),
         ("OpenRouter", "openrouter", "https://openrouter.ai/api/v1"),
         ("Azure OpenAI", "azure", None),
+        ("AWS Bedrock", "bedrock", None),
         ("Ollama", "ollama", ollama_url),
     ]
 

@@ -153,6 +153,16 @@ MODEL_OPTIONS: ProviderModeOptions = {
     # so the two provider keys share one model list.
     "minimax": _MINIMAX_MODELS,
     "minimax-cn": _MINIMAX_MODELS,
+    "bedrock": {
+        "quick": [
+            ("Claude Haiku 4.5 on Bedrock", "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            ("Custom Bedrock model ID or inference profile ARN", "custom"),
+        ],
+        "deep": [
+            ("Claude Sonnet 4.6 on Bedrock", "global.anthropic.claude-sonnet-4-6"),
+            ("Custom Bedrock model ID or inference profile ARN", "custom"),
+        ],
+    },
     # OpenRouter: fetched dynamically. Azure: any deployed model name.
     # Ollama display labels intentionally omit a "local" marker — the
     # endpoint is now configurable via OLLAMA_BASE_URL, so the same labels

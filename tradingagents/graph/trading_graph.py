@@ -25,6 +25,7 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.config import set_config
+from tradingagents.ticker_utils import normalize_ticker_symbol
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -32,6 +33,7 @@ from tradingagents.agents.utils.agent_utils import (
     resolve_instrument_identity,
     get_stock_data,
     get_indicators,
+    get_pam_strategy,
     get_fundamentals,
     get_balance_sheet,
     get_cashflow,
@@ -173,6 +175,7 @@ class TradingAgentsGraph:
                     get_stock_data,
                     # Technical indicators
                     get_indicators,
+                    get_pam_strategy,
                 ]
             ),
             "social": ToolNode(
@@ -323,6 +326,7 @@ class TradingAgentsGraph:
         a per-ticker SqliteSaver so a crashed run can resume from the last
         successful node on a subsequent invocation with the same ticker+date.
         """
+        company_name = normalize_ticker_symbol(str(company_name))
         self.ticker = company_name
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.

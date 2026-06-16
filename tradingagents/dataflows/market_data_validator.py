@@ -15,7 +15,10 @@ from typing import Iterable, Optional
 import pandas as pd
 from stockstats import wrap
 
-from tradingagents.dataflows.stockstats_utils import load_ohlcv
+from tradingagents.dataflows.stockstats_utils import (
+    expected_latest_trading_session,
+    load_ohlcv,
+)
 
 # A fixed, common indicator set so the snapshot is the same shape every run.
 DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (
@@ -83,6 +86,10 @@ def build_verified_market_snapshot(
 
     latest = df.iloc[-1]
     latest_date = _fmt(latest["Date"])
+    latest_dt = pd.to_datetime(latest["Date"]).normalize()
+    expected_latest = expected_latest_trading_session(
+        curr_date, as_of=pd.Timestamp.today()
+    )
     window = max(1, min(int(look_back_days), 30))
     recent = df.tail(window)
 
@@ -91,7 +98,26 @@ def build_verified_market_snapshot(
         "",
         f"- Requested analysis date: {curr_date}",
         f"- Latest trading row used: {latest_date}",
+        f"- Expected last session on or before analysis date: {expected_latest.strftime('%Y-%m-%d')}",
         "- Rows after the requested analysis date are excluded before verification.",
+    ]
+    if latest_dt < expected_latest.normalize():
+        lines.append(
+            "- **Data lag warning**: The latest usable row is older than the "
+            f"expected last session ({expected_latest.strftime('%Y-%m-%d')}). "
+            "Vendor rows without a Close price are dropped. State this gap "
+            "explicitly in the report and do not imply prices for missing sessions."
+        )
+    elif (
+        pd.to_datetime(curr_date).normalize() == pd.Timestamp.today().normalize()
+        and latest_dt < pd.to_datetime(curr_date).normalize()
+    ):
+        lines.append(
+            "- **Pre-market note**: Analysis date is today; the latest *complete* "
+            f"daily bar is {latest_date}. Use that session (not {curr_date}) for "
+            "Last Trading Close, OHLCV, and indicator claims."
+        )
+    lines += [
         "",
         "### Latest verified OHLCV row",
         "",

@@ -1,5 +1,6 @@
 from langchain_core.tools import tool
 from typing import Annotated
+from tradingagents.dataflows.y_finance import analyze_price_action_manipulation
 from tradingagents.dataflows.interface import route_to_vendor
 
 @tool
@@ -30,3 +31,25 @@ def get_indicators(
         except ValueError as e:
             results.append(str(e))
     return "\n\n".join(results)
+
+
+@tool
+def get_pam_strategy(
+    symbol: Annotated[str, "ticker symbol of the company"],
+    curr_date: Annotated[str, "The current trading date you are trading on, YYYY-mm-dd"],
+    look_back_days: Annotated[int, "how many calendar days to look back for PAM events"] = 120,
+    key_level_window: Annotated[int, "prior trading bars used to define support/resistance"] = 20,
+) -> str:
+    """
+    Analyze Price Action Manipulation (PAM) setups for a ticker.
+
+    PAM looks for traps, stop hunts, liquidity grabs, failed breakouts,
+    pump-and-dump behavior, distribution shakeouts, and UC1/DC1 continuation
+    setups using OHLCV price action around recent support/resistance levels.
+    """
+    return analyze_price_action_manipulation(
+        symbol=symbol,
+        curr_date=curr_date,
+        look_back_days=look_back_days,
+        key_level_window=key_level_window,
+    )

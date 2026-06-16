@@ -62,6 +62,58 @@ class TestVerifiedSnapshot:
         close_rows = [ln for ln in snap.splitlines() if ln.startswith("| 2026-")]
         assert 0 < len(close_rows) <= 30
 
+    def test_warns_when_latest_row_lags_expected_session(self, monkeypatch):
+        dates = pd.bdate_range("2026-06-01", "2026-06-12")
+        closes = [740.0 + i for i in range(len(dates))]
+        lagging = pd.DataFrame(
+            {
+                "Date": dates,
+                "Open": closes,
+                "High": [c + 1 for c in closes],
+                "Low": [c - 1 for c in closes],
+                "Close": closes,
+                "Volume": [1_000_000] * len(dates),
+            }
+        )
+        monkeypatch.setattr(validator, "load_ohlcv", lambda s, d: lagging)
+        monkeypatch.setattr(
+            validator.pd.Timestamp,
+            "today",
+            classmethod(lambda cls: pd.Timestamp("2026-06-16")),
+        )
+
+        snap = validator.build_verified_market_snapshot("SPY", "2026-06-16")
+
+        assert "Latest trading row used: 2026-06-12" in snap
+        assert "Expected last session on or before analysis date: 2026-06-15" in snap
+        assert "Data lag warning" in snap
+
+    def test_premarket_note_when_analysis_date_is_today(self, monkeypatch):
+        dates = pd.bdate_range("2026-06-01", "2026-06-15")
+        closes = [740.0 + i for i in range(len(dates))]
+        complete = pd.DataFrame(
+            {
+                "Date": dates,
+                "Open": closes,
+                "High": [c + 1 for c in closes],
+                "Low": [c - 1 for c in closes],
+                "Close": closes,
+                "Volume": [1_000_000] * len(dates),
+            }
+        )
+        monkeypatch.setattr(validator, "load_ohlcv", lambda s, d: complete)
+        monkeypatch.setattr(
+            validator.pd.Timestamp,
+            "today",
+            classmethod(lambda cls: pd.Timestamp("2026-06-16")),
+        )
+
+        snap = validator.build_verified_market_snapshot("SPY", "2026-06-16")
+
+        assert "Latest trading row used: 2026-06-15" in snap
+        assert "Pre-market note" in snap
+        assert "Data lag warning" not in snap
+
 
 @pytest.mark.unit
 class TestTool:

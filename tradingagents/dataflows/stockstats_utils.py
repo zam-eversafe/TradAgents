@@ -62,12 +62,195 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
+def _max_ohlcv_date(data: pd.DataFrame) -> pd.Timestamp | None:
+    """Return the latest ``Date`` with a usable ``Close``, or ``None`` if empty.
+
+    Yahoo sometimes appends calendar rows with volume but NaN OHLC. Those rows
+    are dropped by ``_clean_dataframe`` and must not count as fresh cache data.
+    """
+    if data is None or data.empty:
+        return None
+    frame = _ensure_date_column(data).copy()
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    if "Close" in frame.columns:
+        frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
+        frame = frame.dropna(subset=["Date", "Close"])
+    else:
+        frame = frame.dropna(subset=["Date"])
+    if frame.empty:
+        return None
+    return frame["Date"].max().normalize()
+
+
+def _expected_latest_cache_date(
+    curr_date_dt: pd.Timestamp, today_date: pd.Timestamp
+) -> pd.Timestamp:
+    """Latest row Yahoo should have when downloading with ``end=today``.
+
+    yfinance treats ``end`` as exclusive, so the newest daily bar is usually
+    the prior session. Cap at ``curr_date`` so historical backtests do not
+    force a refresh when the cache already covers the requested window.
+    """
+    latest_available = (today_date.normalize() - pd.offsets.BDay(1)).normalize()
+    return min(curr_date_dt.normalize(), latest_available)
+
+
+def expected_latest_trading_session(
+    curr_date: str, *, as_of: pd.Timestamp | None = None
+) -> pd.Timestamp:
+    """Last session expected to have a ``Close`` on or before ``curr_date``."""
+    ref = (as_of or pd.Timestamp.today()).normalize()
+    return _expected_latest_cache_date(pd.to_datetime(curr_date), ref)
+
+
+def format_missing_session_label(
+    date_str: str,
+    *,
+    curr_date: str,
+    latest_session: pd.Timestamp | None,
+) -> str:
+    """Explain why a calendar date has no indicator/price row in tool output."""
+    missing = pd.to_datetime(date_str).normalize()
+    curr = pd.to_datetime(curr_date).normalize()
+    today = pd.Timestamp.today().normalize()
+    latest = latest_session.normalize() if latest_session is not None else None
+
+    if missing.weekday() >= 5:
+        return "N/A: Not a trading day (weekend or holiday)"
+
+    if (
+        latest is not None
+        and missing > latest
+        and missing == curr
+        and missing >= today
+    ):
+        return (
+            "N/A: Session not yet available "
+            "(analysis date is today; no complete daily bar before market close)"
+        )
+
+    if latest is not None and missing > latest:
+        return "N/A: No market data for this date"
+
+    return "N/A: Not a trading day (weekend or holiday)"
+
+
+def _yahoo_download_end_date(today_date: pd.Timestamp) -> str:
+    """Exclusive Yahoo ``end`` bound that includes the latest daily bar."""
+    return (today_date.normalize() + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+
+
+def _download_yahoo_ohlcv(canonical: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """Download daily OHLCV from Yahoo and normalize to a ``Date`` column."""
+    downloaded = yf_retry(
+        lambda: yf.download(
+            canonical,
+            start=start_str,
+            end=end_str,
+            multi_level_index=False,
+            progress=False,
+            auto_adjust=True,
+        )
+    )
+    if downloaded is None or downloaded.empty:
+        return pd.DataFrame()
+    return _ensure_date_column(downloaded.reset_index())
+
+
+def _merge_ohlcv_frames(base: pd.DataFrame, tail: pd.DataFrame) -> pd.DataFrame:
+    """Merge two OHLCV frames, preferring rows with a usable ``Close`` per date."""
+    if base is None or base.empty:
+        return tail.copy() if tail is not None else pd.DataFrame()
+    if tail is None or tail.empty:
+        return base.copy()
+
+    frames = []
+    for frame in (base, tail):
+        part = _ensure_date_column(frame.copy())
+        part["Date"] = pd.to_datetime(part["Date"], errors="coerce").dt.normalize()
+        if "Close" in part.columns:
+            part["Close"] = pd.to_numeric(part["Close"], errors="coerce")
+        frames.append(part.dropna(subset=["Date"]))
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["_has_close"] = combined["Close"].notna()
+    combined = combined.sort_values(["Date", "_has_close"])
+    return combined.drop_duplicates(subset=["Date"], keep="last").drop(
+        columns="_has_close"
+    ).reset_index(drop=True)
+
+
+def _patch_incomplete_tail(
+    data: pd.DataFrame,
+    canonical: str,
+    curr_date_dt: pd.Timestamp,
+    today_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Backfill recent sessions when bulk Yahoo history has NaN OHLC rows.
+
+    Yahoo often returns the latest one or two daily bars with NaN ``Close``
+    in long-window ``yf.download`` calls while a short-window fetch for the
+    same dates returns complete OHLCV. When the latest usable row trails the
+    expected session, fetch from the day after that row and merge.
+    """
+    if data is None or data.empty:
+        return data
+
+    max_valid = _max_ohlcv_date(data)
+    expected = _expected_latest_cache_date(curr_date_dt, today_date)
+    if max_valid is not None and max_valid >= expected:
+        return data
+
+    tail_start_dt = (
+        (max_valid + pd.Timedelta(days=1)).normalize()
+        if max_valid is not None
+        else (expected - pd.DateOffset(days=60)).normalize()
+    )
+    tail_start = tail_start_dt.strftime("%Y-%m-%d")
+    end_str = _yahoo_download_end_date(today_date)
+    if tail_start >= end_str:
+        return data
+
+    tail = _download_yahoo_ohlcv(canonical, tail_start, end_str)
+    if tail.empty:
+        logger.warning(
+            "Tail OHLCV refresh for %s returned no rows (%s to %s)",
+            canonical,
+            tail_start,
+            end_str,
+        )
+        return data
+
+    merged = _merge_ohlcv_frames(data, tail)
+    patched_max = _max_ohlcv_date(merged)
+    if patched_max is not None and (max_valid is None or patched_max > max_valid):
+        logger.info(
+            "Patched incomplete OHLCV tail for %s (%s -> %s)",
+            canonical,
+            max_valid.strftime("%Y-%m-%d") if max_valid is not None else "none",
+            patched_max.strftime("%Y-%m-%d"),
+        )
+    return merged
+
+
+def _is_cache_stale(
+    data: pd.DataFrame,
+    curr_date_dt: pd.Timestamp,
+    today_date: pd.Timestamp,
+) -> bool:
+    max_date = _max_ohlcv_date(data)
+    if max_date is None:
+        return True
+    return max_date < _expected_latest_cache_date(curr_date_dt, today_date)
+
+
 def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
-    Downloads 15 years of data up to today and caches per symbol. On
-    subsequent calls the cache is reused. Rows after curr_date are
-    filtered out so backtests never see future prices.
+    Downloads five years of data up to today and caches per symbol per day.
+    A cache hit is refreshed when its latest row is behind the most recent
+    trading day Yahoo should expose for the requested analysis date. Rows
+    after curr_date are filtered out so backtests never see future prices.
     """
     # Resolve broker/forex symbols (XAUUSD+ -> GC=F) to Yahoo's convention,
     # then reject values that would escape the cache directory when
@@ -78,11 +261,12 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     config = get_config()
     curr_date_dt = pd.to_datetime(curr_date)
 
-    # Cache uses a fixed window (15y to today) so one file per symbol
+    # Cache uses a fixed window (5y to today) so one file per symbol per day.
     today_date = pd.Timestamp.today()
     start_date = today_date - pd.DateOffset(years=5)
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = today_date.strftime("%Y-%m-%d")
+    download_end_str = _yahoo_download_end_date(today_date)
 
     os.makedirs(config["data_cache_dir"], exist_ok=True)
     data_file = os.path.join(
@@ -97,25 +281,35 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     if os.path.exists(data_file):
         cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
         if not cached.empty and "Close" in cached.columns:
-            data = cached
+            if _is_cache_stale(cached, curr_date_dt, today_date):
+                expected = _expected_latest_cache_date(curr_date_dt, today_date)
+                latest = _max_ohlcv_date(cached)
+                logger.info(
+                    "OHLCV cache for %s is stale (latest row %s, expected at least %s); re-fetching",
+                    canonical,
+                    latest.strftime("%Y-%m-%d") if latest is not None else "unknown",
+                    expected.strftime("%Y-%m-%d"),
+                )
+            else:
+                data = cached
 
     if data is None:
-        downloaded = yf_retry(lambda: yf.download(
-            canonical,
-            start=start_str,
-            end=end_str,
-            multi_level_index=False,
-            progress=False,
-            auto_adjust=True,
-        ))
-        downloaded = _ensure_date_column(downloaded.reset_index())
+        downloaded = _download_yahoo_ohlcv(canonical, start_str, download_end_str)
         # Only cache real data — never persist an empty frame.
         if downloaded.empty or "Close" not in downloaded.columns:
             raise NoMarketDataError(
                 symbol, canonical, "Yahoo Finance returned no rows"
             )
+        downloaded = _patch_incomplete_tail(
+            downloaded, canonical, curr_date_dt, today_date
+        )
         downloaded.to_csv(data_file, index=False, encoding="utf-8")
         data = downloaded
+    else:
+        patched = _patch_incomplete_tail(data, canonical, curr_date_dt, today_date)
+        if _max_ohlcv_date(patched) != _max_ohlcv_date(data):
+            patched.to_csv(data_file, index=False, encoding="utf-8")
+        data = patched
 
     data = _clean_dataframe(data)
 
@@ -154,6 +348,9 @@ class StockstatsUtils:
         df = wrap(data)
         df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
         curr_date_str = pd.to_datetime(curr_date).strftime("%Y-%m-%d")
+        latest_session = (
+            pd.to_datetime(data.iloc[-1]["Date"]) if not data.empty else None
+        )
 
         df[indicator]  # trigger stockstats to calculate the indicator
         matching_rows = df[df["Date"].str.startswith(curr_date_str)]
@@ -161,5 +358,8 @@ class StockstatsUtils:
         if not matching_rows.empty:
             indicator_value = matching_rows[indicator].values[0]
             return indicator_value
-        else:
-            return "N/A: Not a trading day (weekend or holiday)"
+        return format_missing_session_label(
+            curr_date_str,
+            curr_date=curr_date,
+            latest_session=latest_session,
+        )

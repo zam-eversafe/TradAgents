@@ -7,7 +7,9 @@ name = "tradingagents"
 version = "0.2.5"
 description = "TradingAgents: Multi-Agents LLM Financial Trading Framework"
 readme = "README.md"
-requires-python = ">=3.10"
+# 3.14 (especially Windows): many stack deps still lack cp314 wheels; install falls back
+# to Rust/Maturin builds and often fails without a full Rust toolchain.
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "langchain-core>=0.3.81",
     "backtrader>=1.9.78.123",
@@ -30,6 +32,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "typing-extensions>=4.14.0",
     "yfinance>=1.4.1",
+    "langchain-aws>=1.4.5",
 ]
 
 [project.scripts]
