@@ -13,6 +13,17 @@ from .symbol_utils import normalize_symbol, NoMarketDataError
 
 logger = logging.getLogger(__name__)
 
+# A vendor's latest OHLCV row this many calendar days before the requested date
+# is treated as stale. Generous enough to span long holiday weekends, tight
+# enough to catch the year-old frames yfinance occasionally returns (#1021).
+MAX_OHLCV_STALE_DAYS = 10
+
+# How long a same-day cache that does not yet reach the requested day may be
+# reused before it is refetched (#1150). Short enough that an intraday run picks
+# up today's close soon after it publishes, long enough that a day with no bar
+# at all (weekend, holiday) cannot trigger a download on every call.
+OHLCV_CACHE_TTL_SECONDS = 900
+
 
 def yf_retry(func, max_retries=3, base_delay=2.0):
     """Execute a yfinance call with exponential backoff on rate limits.
@@ -244,6 +255,77 @@ def _is_cache_stale(
     return max_date < _expected_latest_cache_date(curr_date_dt, today_date)
 
 
+def _coerce_ohlcv_dates(data: pd.DataFrame) -> pd.Series:
+    """Return parsed dates from an OHLCV frame, whether Date is a column or the index."""
+    if "Date" in data.columns:
+        return pd.to_datetime(data["Date"], errors="coerce").dropna()
+    # yfinance keeps the dates in the index (a DatetimeIndex, sometimes unnamed).
+    if isinstance(data.index, pd.DatetimeIndex):
+        return pd.Series(pd.to_datetime(data.index, errors="coerce")).dropna()
+    # Fallback: expose the index and look for any date-like column.
+    df = data.reset_index()
+    for col in ("Date", "Datetime", "date", "index"):
+        if col in df.columns:
+            parsed = pd.to_datetime(df[col], errors="coerce").dropna()
+            if not parsed.empty:
+                return parsed
+    return pd.Series(dtype="datetime64[ns]")
+
+
+def _assert_ohlcv_not_stale(
+    data: pd.DataFrame,
+    curr_date: str,
+    symbol: str,
+    canonical: str | None = None,
+    *,
+    max_stale_days: int = MAX_OHLCV_STALE_DAYS,
+) -> None:
+    """Reject OHLCV whose latest row is far older than curr_date.
+
+    Raises NoMarketDataError (with a stale-specific detail) so the router treats
+    it like any other "no usable data from this vendor" — try the next vendor,
+    then emit one clear unavailable signal. Empty frames are left to the
+    caller's existing no-data handling; this guards only the dangerous case of
+    present-but-stale rows (a vendor returning a year-old frame that would
+    otherwise feed wrong prices to the agent, #1021).
+    """
+    if data is None or data.empty:
+        return
+    requested = pd.to_datetime(curr_date, errors="coerce")
+    if pd.isna(requested):
+        return
+    requested = requested.normalize()
+    dates = _coerce_ohlcv_dates(data)
+    if dates.empty:
+        return
+    latest = dates.max().normalize()
+    stale_days = (requested - latest).days
+    if stale_days > max_stale_days:
+        raise NoMarketDataError(
+            symbol,
+            canonical,
+            f"latest row is {latest.date()}, {stale_days} days before the "
+            f"requested {requested.date()} (stale) — refusing to use it",
+        )
+
+
+def _needs_same_day_refresh(data_file, curr_date_dt, today_date) -> bool:
+    """Whether a cached frame must be refetched to reflect the requested day.
+
+    The cache file is keyed per day, so without this a run started before the
+    day's bar was final keeps serving that snapshot to every later run (#1150).
+    Two distinct staleness cases exist for a current-day request: the bar may be
+    missing entirely, or present but still in progress — Yahoo publishes a
+    partial daily candle during market hours, whose ``Close`` is not the closing
+    price. Row inspection cannot tell a partial bar from a final one, so the TTL
+    governs every current-day cache. Historical requests always reuse the cache,
+    since those rows are immutable.
+    """
+    if curr_date_dt.date() < today_date.date():
+        return False
+    return time.time() - os.path.getmtime(data_file) > OHLCV_CACHE_TTL_SECONDS
+
+
 def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
@@ -265,7 +347,9 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     today_date = pd.Timestamp.today()
     start_date = today_date - pd.DateOffset(years=5)
     start_str = start_date.strftime("%Y-%m-%d")
-    end_str = today_date.strftime("%Y-%m-%d")
+    # yfinance ``end`` is EXCLUSIVE; the cache key includes tomorrow so today's
+    # row is part of the same file the download requests (#986).
+    end_str = (today_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     download_end_str = _yahoo_download_end_date(today_date)
 
     os.makedirs(config["data_cache_dir"], exist_ok=True)
@@ -289,6 +373,11 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
                     canonical,
                     latest.strftime("%Y-%m-%d") if latest is not None else "unknown",
                     expected.strftime("%Y-%m-%d"),
+                )
+            elif _needs_same_day_refresh(data_file, curr_date_dt, today_date):
+                logger.info(
+                    "OHLCV cache for %s is a same-day snapshot older than TTL; re-fetching",
+                    canonical,
                 )
             else:
                 data = cached
@@ -315,6 +404,10 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
 
     # Filter to curr_date to prevent look-ahead bias in backtesting
     data = data[data["Date"] <= curr_date_dt]
+
+    # Reject a stale frame (latest row far older than curr_date) rather than
+    # feeding year-old prices into indicators (#1021).
+    _assert_ohlcv_not_stale(data, curr_date, symbol, canonical)
 
     return data
 

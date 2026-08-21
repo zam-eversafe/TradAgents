@@ -5,7 +5,15 @@ from dateutil.relativedelta import relativedelta
 import pandas as pd
 import yfinance as yf
 import os
-from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date, format_missing_session_label
+from .stockstats_utils import (
+    StockstatsUtils,
+    _assert_ohlcv_not_stale,
+    _clean_dataframe,
+    filter_financials_by_date,
+    format_missing_session_label,
+    load_ohlcv,
+    yf_retry,
+)
 from .symbol_utils import normalize_symbol, NoMarketDataError
 
 def get_YFin_data_online(
@@ -31,6 +39,11 @@ def get_YFin_data_online(
         raise NoMarketDataError(
             symbol, canonical, f"no rows between {start_date} and {end_date}"
         )
+
+    # Reject a stale frame (e.g. a year-old partial response) before it is
+    # formatted into the report. Raises NoMarketDataError, which the router
+    # turns into one clear unavailable signal (#1021).
+    _assert_ohlcv_not_stale(data, end_date, symbol, canonical)
 
     latest_row = full.iloc[-1]
     latest_date = pd.to_datetime(latest_row["Date"]).strftime("%Y-%m-%d")

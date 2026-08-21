@@ -14,7 +14,7 @@ from unittest import mock
 import pandas as pd
 import pytest
 
-from tradingagents.dataflows import stockstats_utils, interface
+from tradingagents.dataflows import interface, stockstats_utils
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.symbol_utils import NoMarketDataError
 
@@ -33,9 +33,9 @@ class TestLoadOhlcvNoPoison(unittest.TestCase):
 
     def test_empty_download_raises_and_does_not_cache(self):
         empty = pd.DataFrame()
-        with mock.patch.object(stockstats_utils.yf, "download", return_value=empty) as dl:
-            with self.assertRaises(NoMarketDataError):
-                stockstats_utils.load_ohlcv("FAKE", "2026-01-01")
+        with mock.patch.object(stockstats_utils.yf, "download", return_value=empty), \
+                self.assertRaises(NoMarketDataError):
+            stockstats_utils.load_ohlcv("FAKE", "2026-01-01")
         # Nothing should have been written to the cache.
         self.assertEqual(os.listdir(self._tmp), [])
 
@@ -64,7 +64,7 @@ def _ohlcv_through(end_date: str) -> pd.DataFrame:
 def _cache_path(cache_dir: str, symbol: str, today: str) -> str:
     today_dt = pd.Timestamp(today)
     start = (today_dt - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
-    end = today_dt.strftime("%Y-%m-%d")
+    end = (today_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     return os.path.join(cache_dir, f"{symbol}-YFin-data-{start}-{end}.csv")
 
 
@@ -174,11 +174,16 @@ class TestLoadOhlcvCacheHelpers(unittest.TestCase):
         )
 
     def test_format_missing_session_label_for_premarket_today(self):
-        label = stockstats_utils.format_missing_session_label(
-            "2026-06-16",
-            curr_date="2026-06-16",
-            latest_session=pd.Timestamp("2026-06-15"),
-        )
+        with mock.patch.object(
+            stockstats_utils.pd.Timestamp,
+            "today",
+            staticmethod(lambda: pd.Timestamp("2026-06-16")),
+        ):
+            label = stockstats_utils.format_missing_session_label(
+                "2026-06-16",
+                curr_date="2026-06-16",
+                latest_session=pd.Timestamp("2026-06-15"),
+            )
         self.assertIn("Session not yet available", label)
 
     def test_format_missing_session_label_for_weekend(self):
