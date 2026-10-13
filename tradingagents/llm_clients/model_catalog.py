@@ -179,11 +179,11 @@ MODEL_OPTIONS: ProviderModeOptions = {
     "minimax-cn": _MINIMAX_MODELS,
     "bedrock": {
         "quick": [
-            ("Claude Haiku 4.5 on Bedrock", "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            ("Claude Haiku 5.5 on Bedrock", "global.anthropic.claude-haiku-5-5"),
             ("Custom Bedrock model ID or inference profile ARN", "custom"),
         ],
         "deep": [
-            ("Claude Sonnet 4.6 on Bedrock", "global.anthropic.claude-sonnet-4-6"),
+            ("Claude Sonnet 5.5 on Bedrock", "global.anthropic.claude-sonnet-5-5"),
             ("Custom Bedrock model ID or inference profile ARN", "custom"),
         ],
     },
