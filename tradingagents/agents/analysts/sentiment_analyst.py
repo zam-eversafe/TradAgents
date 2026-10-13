@@ -1,28 +1,21 @@
-"""Sentiment analyst — multi-source sentiment analysis for a target ticker.
+"""Sentiment analyst: one sentiment report from four sources.
 
-Previously named ``social_media_analyst``. Renamed and redesigned because
-the old version had a prompt that demanded social-media analysis but the
-only tool available was Yahoo Finance news — which led LLMs to fabricate
-Reddit/X/StockTwits content under prompt pressure (verified live).
+The node fetches its sources before calling the model and puts them in the
+prompt, so the model reports on data it was given rather than inventing posts:
 
-The redesigned agent pre-fetches four complementary data sources before
-the LLM is invoked and injects them into the prompt as structured blocks:
+  1. News headlines: Yahoo Finance
+  2. StockTwits messages: the cashtag stream, with Bullish/Bearish tags
+  3. Reddit posts: r/wallstreetbets, r/stocks, r/investing, or crypto communities for a crypto pair
+  4. Polymarket odds: prediction-market probabilities for the ticker
 
-  1. News headlines     — Yahoo Finance (institutional framing)
-  2. StockTwits messages — retail-trader posts indexed by cashtag, with
-                           user-labeled Bullish/Bearish sentiment tags
-  3. Reddit posts        — r/wallstreetbets, r/stocks, r/investing
-  4. Polymarket odds     — prediction-market probabilities (Gamma API)
+Each source is trimmed to the analysis window. With a TypeSafe key, the social
+posts are screened by Jev first (see post_screen). These feeds serve recent items
+and are not archived, so a historical run's sentiment inputs are not
+point-in-time.
 
-The agent does not use tool-calling; the data is in the prompt from
-turn 0. Output uses the structured-output pattern (json_schema for
-OpenAI/xAI, response_schema for Gemini, tool-use for Anthropic), falling
-back to free-text generation for providers that lack native support, so
-the sentiment header (band + score + confidence) is deterministic across
-runs and providers instead of free-form per-model prose.
-
-See: https://github.com/TauricResearch/TradingAgents/issues/557
-See: https://github.com/TauricResearch/TradingAgents/issues/796
+The report is a SentimentReport through structured output where the provider
+supports it and free text otherwise, so the band, score and confidence header
+reads the same across providers.
 """
 
 from datetime import datetime, timedelta
@@ -30,21 +23,27 @@ from datetime import datetime, timedelta
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from tradingagents.agents.schemas import SentimentReport, render_sentiment_report
-from tradingagents.agents.utils.agent_utils import (
+from tradingagents.agents.context import (
     get_instrument_context_from_state,
     get_language_instruction,
-    get_news,
     resolve_instrument_identity,
 )
-from tradingagents.agents.utils.structured import (
+from tradingagents.agents.post_screen import jev_screen
+from tradingagents.agents.schemas import SentimentReport, render_sentiment_report
+from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
     bind_structured,
     invoke_structured_or_freetext,
 )
-from tradingagents.dataflows.polymarket import fetch_polymarket_odds
-from tradingagents.dataflows.reddit import fetch_reddit_posts
-from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.agents.tools import get_news
+from tradingagents.dataflows.vendors.polymarket import fetch_polymarket_odds
+from tradingagents.dataflows.vendors.reddit import (
+    CRYPTO_SUBREDDITS,
+    DEFAULT_SUBREDDITS,
+    fetch_reddit_posts,
+    subreddits_for,
+)
+from tradingagents.dataflows.vendors.stocktwits import fetch_stocktwits_messages
 
 
 def _seven_days_back(trade_date: str) -> str:
@@ -71,11 +70,19 @@ def create_sentiment_analyst(llm):
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
-        stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
-        identity = resolve_instrument_identity(ticker)
+        # Pass the analysis window so a historical run trims social posts to it
+        # instead of leaking today's chatter into a backtest (#1220).
+        screen = jev_screen(ticker)
+        stocktwits_block = fetch_stocktwits_messages(
+            ticker, limit=30, start_date=start_date, end_date=end_date, screen=screen
+        )
+        subreddits = subreddits_for(ticker)
+        reddit_block = fetch_reddit_posts(
+            ticker, subreddits, start_date=start_date, end_date=end_date, screen=screen
+        )
+        company_name = resolve_instrument_identity(ticker).get("company_name")
         polymarket_block = fetch_polymarket_odds(
-            ticker, company_name=identity.get("company_name")
+            ticker, company_name=company_name, as_of_date=end_date
         )
 
         system_message = _build_system_message(
@@ -86,6 +93,7 @@ def create_sentiment_analyst(llm):
             stocktwits_block=stocktwits_block,
             reddit_block=reddit_block,
             polymarket_block=polymarket_block,
+            subreddits=subreddits,
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -93,8 +101,7 @@ def create_sentiment_analyst(llm):
                 (
                     "system",
                     "You are a helpful AI assistant, collaborating with other assistants."
-                    " If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** or deliverable,"
-                    " prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop."
+                    " Report what your tools support; another agent decides the trade."
                     # No tool-calling here: the data is pre-fetched into the
                     # prompt, so tool-range wording would only invite a
                     # hallucinated tool call (#1130).
@@ -140,8 +147,15 @@ def _build_system_message(
     stocktwits_block: str,
     reddit_block: str,
     polymarket_block: str,
+    subreddits: tuple[str, ...] = DEFAULT_SUBREDDITS,
 ) -> str:
     """Assemble the sentiment-analyst system message with structured data blocks."""
+    if subreddits == DEFAULT_SUBREDDITS:
+        character = "r/wallstreetbets is often contrarian/exuberant; r/stocks more measured; r/investing longer-term"
+    elif len(subreddits) > len(CRYPTO_SUBREDDITS):
+        character = f"r/{subreddits[0]} leans toward the coin's holders; r/CryptoCurrency and r/CryptoMarkets are broader"
+    else:
+        character = "r/CryptoCurrency and r/CryptoMarkets are broad crypto communities"
     return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on four complementary data sources that have already been collected for you.
 
 ## Data sources (pre-fetched, in this prompt)
@@ -160,15 +174,15 @@ Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish /
 {stocktwits_block}
 <end_of_stocktwits>
 
-### Reddit posts — r/wallstreetbets, r/stocks, r/investing (past 7 days)
-Community discussion. Engagement signal via upvote score and comment count. Subreddit character matters (r/wallstreetbets is often contrarian/exuberant; r/stocks more measured; r/investing longer-term).
+### Reddit posts — {", ".join(f"r/{sub}" for sub in subreddits)} (past 7 days)
+Community discussion, without vote or comment counts. Subreddit character matters ({character}).
 
 <start_of_reddit>
 {reddit_block}
 <end_of_reddit>
 
-### Polymarket odds — prediction markets (active markets via Gamma API)
-Crowd-implied probabilities backed by real money. Report only percentage odds and directional movement — do not mention dollar volumes or liquidity.
+### Polymarket odds — crowd-implied probabilities
+High-signal forecast when a relevant market exists. Report specific percentages and recent movement. If the block says odds are withheld or none were found, say so briefly and do not invent prices.
 
 <start_of_polymarket>
 {polymarket_block}
@@ -176,17 +190,17 @@ Crowd-implied probabilities backed by real money. Report only percentage odds an
 
 ## How to analyze this data (best practices)
 
-1. **Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone.
+1. **Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone. A block headed "Screened by Jev" has had off-topic posts removed; its stance count is a classifier's read of every on-topic post fetched, labelled or not, of which the posts listed are a sample. Read it alongside the user tags.
 
 2. **Look for cross-source divergences.** If news framing is bearish but StockTwits is overwhelmingly bullish, that mismatch is itself a signal — it can mean retail is leaning into a thesis the news flow hasn't caught up to (or vice versa, that retail is chasing while institutions are cautious).
 
-3. **Weight Reddit posts by engagement.** A 400-upvote / 200-comment thread reflects community attention; a 3-upvote post is noise. Read the body excerpts for context — the title alone often misleads.
+3. **Read Reddit posts for substance.** The feed carries no vote or comment counts, so judge a post by its body excerpt, not its title alone, and do not infer engagement.
 
 4. **Distinguish opinion from event.** A news headline ("Nvidia announces $500M Corning deal") is an event; a StockTwits post ("buying NVDA, this is going to moon") is opinion. Both are inputs but should be weighted differently in your conclusions.
 
 5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
 
-6. **Use Polymarket odds as a high-signal crowd forecast when relevant markets exist.** Report specific percentages and recent movement (e.g., "72% Yes, up 5% this week"). Weave odds into the narrative as supporting evidence — do not isolate them in a separate section. If no relevant markets were found, say so briefly.
+6. **Use Polymarket odds as a high-signal crowd forecast when relevant markets exist.** Report specific percentages and recent movement (e.g., "72% Yes, up 5% this week"). Weave odds into the narrative as supporting evidence — do not isolate them in a separate section. If no relevant markets were found, or odds were withheld because the analysis date is in the past, say so briefly.
 
 7. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If the sources are silent on a given subreddit, say so.
 
@@ -204,25 +218,3 @@ Fill the following fields:
 - **narrative**: Full source-by-source breakdown, divergences, dominant narrative themes, catalysts and risks, and a markdown summary table of key sentiment signals (direction, source, supporting evidence).
 
 {get_language_instruction()}"""
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compatibility shim
-# ---------------------------------------------------------------------------
-def create_social_media_analyst(llm):
-    """Deprecated alias for :func:`create_sentiment_analyst`.
-
-    Kept so existing code that imports ``create_social_media_analyst``
-    continues to work.
-
-    .. deprecated::
-        Import :func:`create_sentiment_analyst` directly instead.
-    """
-    import warnings
-    warnings.warn(
-        "create_social_media_analyst is deprecated and will be removed in a "
-        "future version. Use create_sentiment_analyst instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return create_sentiment_analyst(llm)

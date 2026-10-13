@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from unittest.mock import patch
 
 import pytest
 
-from tradingagents.dataflows import polymarket
+from tradingagents.dataflows.vendors import polymarket
 
 
 def _mock_event(title: str, slug: str = "test-event") -> dict:

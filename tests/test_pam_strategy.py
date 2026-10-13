@@ -6,8 +6,8 @@ import pytest
 from langchain_core.runnables import RunnableLambda
 
 from tradingagents.agents.analysts.market_analyst import create_market_analyst
-from tradingagents.agents.utils.technical_indicators_tools import get_pam_strategy
-from tradingagents.dataflows.y_finance import (
+from tradingagents.agents.tools import get_pam_strategy
+from tradingagents.dataflows.vendors.yahoo.pam import (
     analyze_price_action_manipulation_frame,
 )
 
@@ -100,7 +100,7 @@ class TestPamCoreDetections:
 @pytest.mark.unit
 def test_pam_tool_wrapper_invokes_analyzer():
     with patch(
-        "tradingagents.agents.utils.technical_indicators_tools.analyze_price_action_manipulation",
+        "tradingagents.agents.tools.analyze_price_action_manipulation",
         return_value="PAM REPORT",
     ) as analyzer:
         result = get_pam_strategy.invoke(
